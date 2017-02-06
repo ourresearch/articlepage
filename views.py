@@ -147,6 +147,8 @@ def get_metadata(doi_url):
 def index_endpoint():
     return jsonify({
         "version": "0.1",
+        "name": "articlepage",
+        "description": "An API that parses webpages for scholarly articles.",
         "documentation_url": "none yet",
         "msg": "Don't panic"
     })
