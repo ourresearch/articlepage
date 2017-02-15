@@ -12,6 +12,7 @@ import requests
 import re
 
 from app import app
+from article_page import ArticlePage
 
 
 
@@ -155,23 +156,19 @@ def index_endpoint():
 
 
 @app.route("/doi/<path:doi>", methods=["GET"])
-def citeas_doi_get(doi):
-    return jsonify({
-        "doi": "{}".format(doi)
-    })
+def doi_endpoint(doi):
+    page = ArticlePage(doi)
+    page.scrape_for_fulltext_link()
+    return jsonify(page.to_dict())
 
-@app.route("/url/<path:url>", methods=["GET"])
-def citeas_url_get(url):
-    response = {"url": url}
 
-    if "github" in url:
-        try:
-            response["zenodo_doi"] = get_zenodo_doi_from_github(url)
-            response["metadata"] = get_metadata(response["zenodo_doi"])
-        except NotFoundException:
-            abort_json(404, u"No README found at {}".format(url))
 
-    return jsonify(response)
+
+
+
+
+
+
 
 
 

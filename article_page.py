@@ -3,6 +3,7 @@
 
 import sys
 import os
+import socket
 import requests
 import re
 import urlparse
@@ -11,224 +12,95 @@ from lxml import html
 from lxml import etree
 from contextlib import closing
 
-from oa_local import find_normalized_license
-from open_version import OpenVersion
-from http_cache import http_get
 from util import is_doi_url
 from util import elapsed
-from http_cache import is_response_too_large
 
 
 DEBUG_SCRAPING = False
 
 
 
-class Webpage(object):
-    def __init__(self, **kwargs):
-        self.url = None
-        self.scraped_pdf_url = None
-        self.scraped_open_metadata_url = None
-        self.scraped_license = "unknown"
+
+
+class ArticlePage(object):
+    def __init__(self, doi):
+        self.pdf_url = None
+        self.resolved_url = None
+        self.license = "unknown"
         self.error = None
         self.error_message = None
-        self.related_pub = None
-        for (k, v) in kwargs.iteritems():
-            self.__setattr__(k, v)
-        if not self.url:
-            self.url = u"http://doi.org/{}".format(self.doi)
+        self.pdf_is_free_to_read = None
 
-    @property
-    def doi(self):
-        if self.related_pub:
-            return self.related_pub.doi
-        return None
-
-    @property
-    def fulltext_url(self):
-        if self.scraped_pdf_url:
-            return self.scraped_pdf_url
-        if self.scraped_open_metadata_url:
-            return self.scraped_open_metadata_url
-        return None
-
-    @property
-    def has_fulltext_url(self):
-        if self.scraped_pdf_url or self.scraped_open_metadata_url:
-            return True
-        return False
+        self.doi = doi
 
 
-    #overridden in some subclasses
-    @property
-    def is_open(self):
-        if self.scraped_pdf_url or self.scraped_open_metadata_url:
-            return True
-        if self.scraped_license and self.scraped_license != "unknown":
-            return True
-        return False
-
-    def mint_open_version(self):
-        my_version = OpenVersion()
-        my_version.pdf_url = self.scraped_pdf_url
-        my_version.metadata_url = self.scraped_open_metadata_url
-        my_version.license = self.scraped_license
-        my_version.doi = self.related_pub.doi
-        my_version.source = self.open_version_source_string
-        if self.is_open and not my_version.best_fulltext_url:
-            my_version.metadata_url = self.url
-        return my_version
 
     def scrape_for_fulltext_link(self):
-        url = self.url
-        is_journal = u"/doi/" in url or u"10." in url
 
-        dont_scrape_list = [
-                u"ncbi.nlm.nih.gov",
-                u"elar.rsvpu.ru",  #these ones based on complaint in email
-                u"elib.uraic.ru",
-                u"elar.usfeu.ru",
-                u"elar.urfu.ru",
-                u"elar.uspu.ru"]
-
-        if DEBUG_SCRAPING:
-            print u"in scrape_for_fulltext_link, getting URL: {}".format(url)
-
-        for url_fragment in dont_scrape_list:
-            if url_fragment in url:
-                print u"not scraping {} because is on our do not scrape list.".format(url)
-                if "ncbi.nlm.nih.gov/pmc/articles/PMC" in url:
-                    # pmc has fulltext
-                    self.scraped_open_metadata_url = url
-                    pmcid_matches = re.findall(".*(PMC\d+).*", url)
-                    if pmcid_matches:
-                        pmcid = pmcid_matches[0]
-                        self.scraped_pdf_url = u"https://www.ncbi.nlm.nih.gov/pmc/articles/{}/pdf".format(pmcid)
-                return
+        doi_resolver_url = u"http://doi.org/{}".format(self.doi)
 
         try:
-            with closing(http_get(url, stream=True, read_timeout=10, doi=self.doi)) as r:
-
-                if is_response_too_large(r):
-                    print "landing page is too large, skipping"
-                    return
-
-                # if our url redirects to a pdf, we're done.
-                # = open repo http://hdl.handle.net/2060/20140010374
-                if resp_is_pdf_from_header(r):
-
-                    if DEBUG_SCRAPING:
-                        print u"the head says this is a PDF. success! [{}]".format(url)
-                    self.scraped_pdf_url = url
-                    return
-
-                else:
-                    if DEBUG_SCRAPING:
-                        print u"head says not a PDF for {}.  continuing more checks".format(url)
+            with closing(http_get(doi_resolver_url)) as r:
 
                 # get the HTML tree
                 page = r.content
 
+                # the DOI resolved to some URL; it's handy to note it down for debugging.
+                self.resolved_url = r.url
+
                 # set the license if we can find one
                 scraped_license = find_normalized_license(page)
                 if scraped_license:
-                    self.scraped_license = scraped_license
+                    self.license = scraped_license
 
-                pdf_download_link = find_pdf_link(page, url)
+                pdf_download_link = find_pdf_link(page, self.doi)
                 if pdf_download_link is not None:
                     if DEBUG_SCRAPING:
                         print u"found a PDF download link: {} {} [{}]".format(
-                            pdf_download_link.href, pdf_download_link.anchor, url)
+                            pdf_download_link.href, pdf_download_link.anchor, self.doi)
 
-                    pdf_url = get_link_target(pdf_download_link, r.url)
-                    if is_journal:
-                        # if they are linking to a PDF, we need to follow the link to make sure it's legit
-                        if DEBUG_SCRAPING:
-                            print u"this is a journal. checking to see the PDF link actually gets a PDF [{}]".format(url)
-                        if gets_a_pdf(pdf_download_link, r.url, self.doi):
-                            self.scraped_pdf_url = pdf_url
-                            self.scraped_open_metadata_url = url
-                            return
+                    self.pdf_url = get_link_target(pdf_download_link, r.url)
+
+
+                    # let's follow the pdf link to see if it leads a a real pdf, or some paywall nonsense
+                    if DEBUG_SCRAPING:
+                        print u"checking to see the PDF link actually gets a PDF [{}]".format(self.doi)
+
+                    if gets_a_pdf(pdf_download_link, r.url, self.doi):
+                        self.pdf_is_free_to_read = True
                     else:
-                        self.scraped_pdf_url = pdf_url
-                        self.scraped_open_metadata_url = url
-                        return
-
-                # try this later because would rather get a pdfs
-                # if they are linking to a .docx or similar, this is open.
-                # this only works for repos... a ".doc" in a journal is not the article. example:
-                # = closed journal http://doi.org/10.1007/s10822-012-9571-0
-                if not is_journal:
-                    doc_link = find_doc_download_link(page)
-                    if doc_link is not None:
-                        if DEBUG_SCRAPING:
-                            print u"found a .doc download link {} [{}]".format(
-                                get_link_target(doc_link, r.url), url)
-                        self.scraped_open_metadata_url = url
-                        return
+                        self.pdf_is_free_to_read = False
 
         except requests.exceptions.ConnectionError:
-            print u"ERROR: connection error on {} in scrape_for_fulltext_link, skipping.".format(url)
-            return
+            print u"ERROR: connection error on {} in scrape_for_fulltext_link, skipping.".format(self.doi)
+
         except requests.Timeout:
-            print u"ERROR: timeout error on {} in scrape_for_fulltext_link, skipping.".format(url)
-            return
+            print u"ERROR: timeout error on {} in scrape_for_fulltext_link, skipping.".format(self.doi)
+
         except requests.exceptions.InvalidSchema:
-            print u"ERROR: InvalidSchema error on {} in scrape_for_fulltext_link, skipping.".format(url)
-            return
+            print u"ERROR: InvalidSchema error on {} in scrape_for_fulltext_link, skipping.".format(self.doi)
+
         except requests.exceptions.RequestException as e:
-            print u"ERROR: RequestException error on {} in scrape_for_fulltext_link, skipping.".format(url)
-            return
+            print u"ERROR: RequestException error on {} in scrape_for_fulltext_link, skipping.".format(self.doi)
 
         if DEBUG_SCRAPING:
-            print u"found no PDF download link.  end of the line. [{}]".format(url)
+            print u"found no PDF download link.  end of the line. [{}]".format(self.doi)
 
         return self
 
-
     def __repr__(self):
-        return u"<{} ({}) {}>".format(self.__class__.__name__, self.url, self.is_open)
+        return u"<{} ({}) {}>".format(self.__class__.__name__, self.doi)
 
-
-
-class OpenPublisherWebpage(Webpage):
-    open_version_source_string = u"publisher landing page"
-
-    @property
-    def is_open(self):
-        return True
-
-
-class PublisherWebpage(Webpage):
-    open_version_source_string = u"publisher landing page"
-
-    @property
-    def is_open(self):
-        if self.scraped_pdf_url or self.scraped_open_metadata_url:
-            return True
-        # just having the license isn't good enough
-        return False
-
-
-# abstract.  inherited from WebpageInOpenRepo and WebpageInUnknownRepo
-class WebpageInRepo(Webpage):
-
-    @property
-    def open_version_source_string(self):
-        if self.scraped_pdf_url or self.scraped_open_metadata_url:
-            u"scraping of {}".format(self.base_open_version_source_string)
-        return self.base_open_version_source_string
-
-
-class WebpageInOpenRepo(WebpageInRepo):
-    base_open_version_source_string = u"oa repository (via base-search.net oa url)"
-
-    @property
-    def is_open(self):
-        return True
-
-
-class WebpageInUnknownRepo(WebpageInRepo):
-    base_open_version_source_string = u"oa repository (via base-search.net unknown-license url)"
+    def to_dict(self):
+        return {
+            "doi": self.doi,
+            "resolved_url": self.resolved_url,
+            "pdf_url": self.pdf_url,
+            "pdf_is_free_to_read": self.pdf_is_free_to_read,
+            "license": self.license,
+            "error": self.error,
+            "error_message": self.error_message
+        }
 
 
 
@@ -260,7 +132,7 @@ def gets_a_pdf(link, base_url, doi=None):
 
     start = time()
     try:
-        with closing(http_get(absolute_url, stream=True, read_timeout=10, doi=doi)) as r:
+        with closing(http_get(absolute_url, stream=True, read_timeout=10)) as r:
             if resp_is_pdf_from_header(r):
                 if DEBUG_SCRAPING:
                     print u"http header says this is a PDF. took {}s {}".format(
@@ -318,24 +190,6 @@ def gets_a_pdf(link, base_url, doi=None):
     except requests.exceptions.RequestException:
         print u"ERROR: RequestException error in gets_a_pdf, skipping."
         return False
-
-
-
-def find_doc_download_link(page):
-    tree = get_tree(page)
-    for link in get_useful_links(tree):
-        # there are some links that are FOR SURE not the download for this article
-        if has_bad_href_word(link.href):
-            continue
-
-        if has_bad_anchor_word(link.anchor):
-            continue
-
-        # = open repo https://lirias.kuleuven.be/handle/123456789/372010
-        if ".doc" in link.href or ".doc" in link.anchor:
-            return link
-
-    return None
 
 
 # it matters this is just using the header, because we call it even if the content
@@ -596,3 +450,97 @@ def get_link_target(link, base_url):
 
     return url
 
+
+
+
+def find_normalized_license(text):
+    normalized_text = text.replace(" ", "").replace("-", "").lower()
+
+    # the lookup order matters
+    # assumes no spaces, no dashes, and all lowercase
+    # inspired by https://github.com/CottageLabs/blackbox/blob/fc13e5855bd13137cf1ef8f5e93883234fdab464/service/licences.py
+    # thanks CottageLabs!  :)
+
+    license_lookups = [
+        ("creativecommons.org/licenses/byncnd", "cc-by-nc-nd"),
+        ("creativecommonsattributionnoncommercialnoderiv", "cc-by-nc-nd"),
+        ("ccbyncnd", "cc-by-nc-nd"),
+
+        ("creativecommons.org/licenses/byncsa", "cc-by-nc-sa"),
+        ("creativecommonsattributionnoncommercialsharealike", "cc-by-nc-sa"),
+        ("ccbyncsa", "cc-by-nc-sa"),
+
+        ("creativecommons.org/licenses/bynd", "cc-by-nd"),
+        ("creativecommonsattributionnoderiv", "cc-by-nd"),
+        ("ccbynd", "cc-by-nd"),
+
+        ("creativecommons.org/licenses/bysa", "cc-by-sa"),
+        ("creativecommonsattributionsharealike", "cc-by-sa"),
+        ("ccbysa", "cc-by-sa"),
+
+        ("creativecommons.org/licenses/bync", "cc-by-nc"),
+        ("creativecommonsattributionnoncommercial", "cc-by-nc"),
+        ("ccbync", "cc-by-nc"),
+
+        ("creativecommons.org/licenses/by", "cc-by"),
+        ("creativecommonsattribution", "cc-by"),
+        ("ccby", "cc-by"),
+
+        ("creativecommons.org/publicdomain/zero", "cc0"),
+        ("creativecommonszero", "cc0"),
+
+        ("creativecommons.org/publicdomain/mark", "pd"),
+        ("publicdomain", "pd"),
+
+        # ("openaccess", "oa")
+    ]
+
+    for (lookup, license) in license_lookups:
+        if lookup in normalized_text:
+            return license
+    return "unknown"
+
+
+
+def is_response_too_large(r):
+    if not "Content-Length" in r.headers:
+        print u"can't tell if page is too large, no Content-Length header {}".format(r.url)
+        return False
+
+    content_length = r.headers["Content-Length"]
+    # if is bigger than 1 MB, don't keep it don't parse it, act like we couldn't get it
+    # if doing 100 in parallel, this would be 100MB, which fits within 512MB dyno limit
+    if int(content_length) >= (1 * 1000 * 1000):
+        print u"Content Too Large on GET on {url}".format(url=r.url)
+        return True
+    return False
+
+# this is mostly copied from oaDOI but without the cache stuff.
+def http_get(url, headers={}, read_timeout=20, stream=False, allow_redirects=True):
+
+    try:
+        try:
+            print u"LIVE GET on {url}".format(url=url)
+        except UnicodeDecodeError:
+            print u"LIVE GET on an url that throws UnicodeDecodeError"
+
+        connect_timeout = 3
+        r = requests.get(url,
+                         headers=headers,
+                         timeout=(connect_timeout, read_timeout),
+                         stream=stream,
+                         allow_redirects=allow_redirects,
+                         verify=False)
+
+        if r and not r.encoding:
+            r.encoding = "utf-8"
+
+    except (requests.exceptions.Timeout, socket.timeout) as e:
+        print u"timed out on GET on {url}".format(url=url)
+        raise
+
+    except requests.exceptions.RequestException as e:
+        print u"RequestException on GET on {url}".format(url=url)
+        raise
+
+    return r
